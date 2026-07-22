@@ -90,13 +90,21 @@ CREATE TABLE tariff (
 
 -- 9. 차량 Trim (Model 1:N)
 CREATE TABLE vehicle_trim (
-    vehicle_trim_id  BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-    model_id         BIGINT UNSIGNED NOT NULL,
-    trim_name        VARCHAR(200) NOT NULL,
-    battery_kwh      DECIMAL(6,2) NULL,
-    normal_range_km  INT NULL,
-    max_ac_kw        DECIMAL(5,2) NULL,
-    max_dc_kw        DECIMAL(5,2) NULL,
+     vehicle_trim_id       BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    model_id              BIGINT UNSIGNED NOT NULL,
+    trim_name              VARCHAR(200)    NOT NULL,
+    vehicle_type           VARCHAR(50)         NULL,       -- 차량 유형(예: 중형 SUV)
+    is_current_sale         BOOLEAN             NULL,       -- 현재 국내 판매 중 여부
+    battery_kwh            DECIMAL(6,2)        NULL,       -- 배터리 용량(kWh)
+    normal_range_km        INT                 NULL,       -- 상온 주행가능거리(km)
+    cold_range_km           INT                 NULL,       -- 저온 복합 주행거리(km)
+    max_ac_kw              DECIMAL(5,2)        NULL,       -- 차량 최대 AC 충전 입력(kW)
+    max_dc_kw               DECIMAL(5,2)        NULL,       -- 차량 최대 DC 충전 입력(kW)
+    efficiency_km_per_kwh   DECIMAL(4,2)        NULL,       -- 공인 전비(km/kWh)
+    fast_charge_minutes     INT                 NULL,       -- 급속 충전 소요 시간(분)
+    data_source              VARCHAR(500)        NULL,       -- 스펙 출처
+    surveyed_at              DATE                NULL,       -- 조사 기준일
+    note                     VARCHAR(500)        NULL,       -- 비고(트림 분리 사유, 저온값 산출 방식 등)
     PRIMARY KEY (vehicle_trim_id),
     CONSTRAINT fk_trim_model FOREIGN KEY (model_id) REFERENCES vehicle_model (model_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
