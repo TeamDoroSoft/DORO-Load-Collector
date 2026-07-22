@@ -1,0 +1,23 @@
+# Go 빌드 산출물
+/ev-charger-collector/ev-charger-collector
+*.exe
+*.test
+*.out
+
+# 수집 결과물(로컬 출력)
+/ev-charger-collector/output/*
+!/ev-charger-collector/output/.gitkeep
+
+# 환경변수·비밀정보
+.env
+*.env
+.env.local
+
+# 에디터/OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Windows 다운로드 잔재
+*:Zone.Identifier
