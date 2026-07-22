@@ -5,7 +5,9 @@
 //   - charger:status:{charger_id}            Hash {status, source_updated_at, collected_at}
 //   - station:availability:{station_id}      Hash {rapid_total, rapid_available, slow_total, slow_available}
 //   - station:connector_breakdown:{station_id} String(JSON)
-//   - collector:last_run                     String(ISO timestamp + 요약 통계)
+//   - collector:last_run                     String(ISO timestamp + 요약 통계, fast 실행마다 갱신)
+//   - collector:last_run:fast                String(fast path 전용 마지막 실행 기록)
+//   - collector:last_run:slow                String(slow path 전용 마지막 실행 기록)
 //
 // 쓰기 순서 원칙: db.UpsertStation 커밋 성공 직후 그 station만 즉시 갱신한다.
 // Redis 실패는 1회 재시도 후 경고만 남기고 파이프라인을 막지 않는다.
@@ -160,20 +162,36 @@ func (c *Client) RefreshConnectorBreakdown(ctx context.Context, stationID int64,
 	})
 }
 
-// RefreshLastRun은 마지막 실행 시각과 요약 통계를 collector:last_run에 기록한다.
-// 헬스체크/화면 "마지막 수집 시간" 표시에 쓰이므로 TTL 없이 유지한다.
-func (c *Client) RefreshLastRun(ctx context.Context, finishedAt time.Time, stats model.PipelineStats) error {
+// RefreshLastRun은 마지막 실행 시각과 요약 통계를 기록한다. mode(fast/slow/archive)별로
+// collector:last_run:{mode} 키를 항상 갱신하고, mode가 "fast"일 때만 공용 키
+// collector:last_run도 함께 갱신한다 — fast path가 훨씬 자주 도는 갱신 주기이므로
+// 화면 "마지막 수집 시간" 표시엔 fast 기준이 더 정확하다는 설계 결정이다(slow 전용
+// 배포 과도기에는 공용 키가 갱신되지 않는다는 점을 배포 문서에 명시해둔다).
+// 헬스체크/화면 표시에 쓰이므로 TTL 없이 유지한다.
+func (c *Client) RefreshLastRun(ctx context.Context, finishedAt time.Time, stats model.PipelineStats, mode string) error {
 	payload := map[string]any{
 		"finished_at": formatTime(finishedAt),
+		"mode":        mode,
 		"stats":       stats,
 	}
 	data, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("last_run 인코딩 실패: %w", err)
 	}
-	return c.withRetry(func() error {
-		return c.rdb.Set(ctx, "collector:last_run", data, 0).Err()
-	})
+
+	keys := []string{fmt.Sprintf("collector:last_run:%s", mode)}
+	if mode == "fast" {
+		keys = append(keys, "collector:last_run")
+	}
+
+	var firstErr error
+	for _, key := range keys {
+		k := key
+		if err := c.withRetry(func() error { return c.rdb.Set(ctx, k, data, 0).Err() }); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
 }
 
 // withRetry는 Redis 쓰기를 1회 재시도한 뒤 실패하면 경고만 남기고 error를 반환한다.

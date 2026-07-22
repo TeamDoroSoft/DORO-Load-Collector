@@ -126,15 +126,46 @@ type NormalizedStation struct {
 	Chargers     []NormalizedCharger
 }
 
+// PipelineStatus는 1회 실행이 어떤 상태로 마무리됐는지 나타내는 종료 신호다.
+// 로그(pipeline_summary)와 Redis(collector:last_run)에 실려, 운영자가 이번 실행이
+// 전량 완주했는지 부분 완료/중단으로 끝났는지 명확히 구분할 수 있게 한다.
+type PipelineStatus string
+
+const (
+	StatusComplete       PipelineStatus = "complete"        // 전량 정상 수집 완료
+	StatusEmptyResponse  PipelineStatus = "empty_response"  // 빈 XML 응답(쿼터 소진 등)으로 즉시 중단
+	StatusBudgetExceeded PipelineStatus = "budget_exceeded" // 전체 마감시간 초과/취소로 부분 완료
+	StatusRecovered      PipelineStatus = "recovered"       // S3 수동 복구 모드로 적재
+	StatusError          PipelineStatus = "error"           // 그 외 오류로 부분 완료/중단
+)
+
 // PipelineStats는 1회 실행의 단계별 건수를 모은 구조화 통계다.
 // run_log 단계에서 CloudWatch Logs Insights가 집계할 수 있는 형태로 출력한다.
 type PipelineStats struct {
-	CollectedItems  int // fetch로 수집한 총 item 수
-	InvalidItems    int // validate에서 걸러진 오류 item 수
-	ValidItems      int // 검증 통과 item 수
-	NormalizedStns  int // 정규화된 station 수
-	UpsertedStns    int // DB upsert 성공 station 수
-	FailedStns      int // DB upsert 실패(스킵) station 수
-	CacheRefreshed  int // 캐시 갱신 성공 station 수
-	CacheFailedStns int // 캐시 갱신 실패 station 수
+	CollectedItems  int            // fetch로 수집한 총 item 수
+	InvalidItems    int            // validate에서 걸러진 오류 item 수
+	ValidItems      int            // 검증 통과 item 수
+	NormalizedStns  int            // 정규화된 station 수
+	UpsertedStns    int            // DB upsert 성공 station 수
+	FailedStns      int            // DB upsert 실패(스킵) station 수
+	CacheRefreshed  int            // 캐시 갱신 성공 station 수
+	CacheFailedStns int            // 캐시 갱신 실패 station 수
+	Status          PipelineStatus // 이번 실행의 종료 상태 신호
+	// SkippedNewStations는 fast path에서 프리로드 매핑(StationChargerMap)에 없어
+	// 통째로 스킵한 신규 station 수다(slow path에서는 항상 0 — 신규 station도 upsert함).
+	SkippedNewStations int
+	// SkippedNewChargers는 fast path에서 station은 있으나 charger가 프리로드 매핑에
+	// 없어 스킵한 신규 charger 수다(slow path에서는 항상 0).
+	SkippedNewChargers int
+}
+
+// ArchiveStats는 --mode=archive 1회 실행의 단계별 건수를 모은 구조화 통계다.
+// PipelineStats와 성격이 달라(수집 파이프라인이 아니라 조회→S3업로드→삭제 배치)
+// 별도 구조체로 둔다.
+type ArchiveStats struct {
+	ScannedRows  int  // SelectOldStatusHistory로 조회한 대상 행 수(배치 합계)
+	ArchivedRows int  // S3 업로드까지 성공한 행 수
+	DeletedRows  int  // RDS 삭제까지 성공한 행 수
+	Batches      int  // 처리한 배치 수
+	DryRun       bool // --archive-dry-run이면 true(업로드/삭제 없이 대상 건수만 집계)
 }

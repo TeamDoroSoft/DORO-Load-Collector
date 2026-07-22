@@ -14,15 +14,21 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"encoding/xml"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
+	"regexp"
+	"sort"
+	"strconv"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 
+	"ev-charger-collector/internal/db"
 	"ev-charger-collector/internal/model"
 	"ev-charger-collector/internal/validate"
 )
@@ -68,34 +74,45 @@ const (
 	rawBaseBackoff   = 1 * time.Second
 )
 
-// PersistRawPages는 원본 XML을 로컬에 항상 저장하고, S3가 활성이면 업로드한다.
-// S3 업로드는 지수 백오프 3회 재시도하며, 최종 실패 시 error를 반환한다(파이프라인 중단).
-func (s *Storage) PersistRawPages(ctx context.Context, pages []RawPage) error {
+// PersistRawPage는 한 페이지의 원본 XML을 로컬에 저장하고, S3가 활성이면 즉시 업로드한다.
+// 페이지별 즉시 저장이므로, 페이지네이션 도중 프로세스가 강제 종료(SIGKILL/OOM/panic)돼도
+// 이미 API로 받아온 페이지는 유실되지 않는다. S3 업로드는 지수 백오프 3회 재시도하며,
+// 최종 실패 시 error를 반환한다(원본 보존은 CLAUDE.md 필수 규칙이므로 파이프라인 중단).
+func (s *Storage) PersistRawPage(ctx context.Context, p RawPage) error {
 	rawDir := filepath.Join(s.cfg.OutputDir, "raw")
 	if err := os.MkdirAll(rawDir, 0o755); err != nil {
 		return fmt.Errorf("raw 디렉터리 생성 실패: %w", err)
 	}
 
-	ts := time.Now().UTC().Format("20060102150405")
-	datePart := time.Now().UTC().Format("20060102")
+	now := time.Now().UTC()
+	ts := now.Format("20060102150405")
+	datePart := now.Format("20060102")
+	fname := fmt.Sprintf("evcharger_page%d_%s.xml", p.PageNo, ts)
 
-	for _, p := range pages {
-		fname := fmt.Sprintf("evcharger_page%d_%s.xml", p.PageNo, ts)
-
-		localPath := filepath.Join(rawDir, fname)
-		if err := os.WriteFile(localPath, p.RawXML, 0o644); err != nil {
-			return fmt.Errorf("원본 XML 로컬 저장 실패(page=%d): %w", p.PageNo, err)
-		}
-
-		if s.s3Enabled() {
-			key := s.s3Key("raw", datePart, fname)
-			if err := s.uploadWithRetry(ctx, key, p.RawXML); err != nil {
-				return fmt.Errorf("원본 XML S3 업로드 실패(page=%d, key=%s): %w", p.PageNo, key, err)
-			}
-		}
+	localPath := filepath.Join(rawDir, fname)
+	if err := os.WriteFile(localPath, p.RawXML, 0o644); err != nil {
+		return fmt.Errorf("원본 XML 로컬 저장 실패(page=%d): %w", p.PageNo, err)
 	}
 
-	log.Printf("[storage] 원본 %d개 페이지 저장 완료(로컬=%s, s3=%v)", len(pages), rawDir, s.s3Enabled())
+	if s.s3Enabled() {
+		key := s.s3Key("raw", datePart, fname)
+		if err := s.uploadWithRetry(ctx, key, p.RawXML); err != nil {
+			return fmt.Errorf("원본 XML S3 업로드 실패(page=%d, key=%s): %w", p.PageNo, key, err)
+		}
+	}
+	return nil
+}
+
+// PersistRawPages는 여러 페이지를 순회하며 PersistRawPage로 각각 저장하는 얇은 래퍼다.
+// 공개 API를 유지해 복구 모드 등에서 재사용할 수 있게 한다(정상 수집 경로에서는
+// collectAll이 페이지별로 PersistRawPage를 직접 호출한다).
+func (s *Storage) PersistRawPages(ctx context.Context, pages []RawPage) error {
+	for _, p := range pages {
+		if err := s.PersistRawPage(ctx, p); err != nil {
+			return err
+		}
+	}
+	log.Printf("[storage] 원본 %d개 페이지 저장 완료(로컬=%s, s3=%v)", len(pages), filepath.Join(s.cfg.OutputDir, "raw"), s.s3Enabled())
 	return nil
 }
 
@@ -156,6 +173,46 @@ func (s *Storage) PersistErrorItems(ctx context.Context, items []validate.Invali
 	}
 	log.Printf("[storage] 오류 item %d건 저장 완료(로컬=%s, s3=%v)", len(items), localPath, s.s3Enabled())
 	return nil
+}
+
+// PersistHistoryArchiveBatch는 아카이브 대상 charger_status_history 배치 하나를 JSON으로
+// S3에 업로드한다(콜드 아카이브 전용 — S3_BUCKET 미설정이면 아카이브 자체가 무의미하므로
+// 에러를 반환한다). 업로드 실패 시 error를 반환하며, 호출측(archive.go)은 이 배치의
+// RDS DELETE를 수행하지 않고 중단해야 한다(원본 보존 성공 후에만 다음 단계로 가는
+// 기존 PersistRawPage 원칙과 동일).
+func (s *Storage) PersistHistoryArchiveBatch(ctx context.Context, rows []db.ArchivableHistoryRow, runDate time.Time, batchSeq int) error {
+	if len(rows) == 0 {
+		return nil
+	}
+	if !s.s3Enabled() {
+		return fmt.Errorf("아카이브에는 S3_BUCKET 설정이 필수입니다(콜드 아카이브 목적)")
+	}
+
+	data, err := marshalIndent(rows)
+	if err != nil {
+		return fmt.Errorf("아카이브 배치 인코딩 실패: %w", err)
+	}
+
+	key := s.archiveKey(runDate.UTC().Format("20060102"), batchSeq)
+	if err := s.uploadWithRetry(ctx, key, data); err != nil {
+		return fmt.Errorf("아카이브 배치 S3 업로드 실패(key=%s): %w", key, err)
+	}
+	log.Printf("[storage] 아카이브 배치 업로드 완료: %d건 -> %s", len(rows), key)
+	return nil
+}
+
+// archiveKey는 아카이브 배치의 S3 키를 만든다:
+// <prefix?>/evcharger/archive/charger_status_history/<YYYYMMDD>/batch_<seq>_<ts>.json
+// (날짜는 아카이브 실행일 기준 파티션이다 — 원본 이력의 collected_at이 아니다.)
+func (s *Storage) archiveKey(datePart string, batchSeq int) string {
+	ts := time.Now().UTC().Format("20060102150405")
+	parts := make([]string, 0, 5)
+	if s.cfg.S3Prefix != "" {
+		parts = append(parts, s.cfg.S3Prefix)
+	}
+	parts = append(parts, "evcharger", "archive", "charger_status_history", datePart,
+		fmt.Sprintf("batch_%d_%s.json", batchSeq, ts))
+	return filepath.ToSlash(filepath.Join(parts...))
 }
 
 // s3Key는 prefix/category/date/name 형태의 S3 오브젝트 키를 만든다.
@@ -222,4 +279,141 @@ func (c *s3Client) PutObject(ctx context.Context, bucket, key string, body []byt
 		Body:   bytes.NewReader(body),
 	})
 	return err
+}
+
+// --- 수동 S3 복구(읽기 전용) ---
+
+// S3Downloader는 복구 모드에서 S3에 보존된 원본 XML을 되읽는 읽기 전용 인터페이스다.
+// (업로드용 S3Uploader와 분리해, 복구 경로가 쓰기 권한 없이도 동작하도록 추상화한다.)
+type S3Downloader interface {
+	// ListObjects는 prefix로 시작하는 모든 객체 키를 반환한다.
+	ListObjects(ctx context.Context, bucket, prefix string) ([]string, error)
+	// GetObject는 지정 키의 객체 본문을 바이트로 반환한다.
+	GetObject(ctx context.Context, bucket, key string) ([]byte, error)
+}
+
+// NewS3Downloader는 EC2 Instance Profile 자격증명을 자동 사용하는 읽기 전용 S3 다운로더를
+// 만든다(기존 NewS3Uploader와 별개, 같은 s3Client 타입을 재사용).
+func NewS3Downloader(ctx context.Context) (S3Downloader, error) {
+	cfg, err := config.LoadDefaultConfig(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("AWS 기본 설정 로드 실패: %w", err)
+	}
+	return &s3Client{cli: s3.NewFromConfig(cfg)}, nil
+}
+
+// ListObjects는 ListObjectsV2Paginator로 prefix 하위 모든 객체 키를 나열한다.
+func (c *s3Client) ListObjects(ctx context.Context, bucket, prefix string) ([]string, error) {
+	paginator := s3.NewListObjectsV2Paginator(c.cli, &s3.ListObjectsV2Input{
+		Bucket: &bucket,
+		Prefix: &prefix,
+	})
+	var keys []string
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("S3 객체 나열 실패(prefix=%s): %w", prefix, err)
+		}
+		for _, obj := range page.Contents {
+			if obj.Key != nil {
+				keys = append(keys, *obj.Key)
+			}
+		}
+	}
+	return keys, nil
+}
+
+// GetObject는 지정 키의 객체 본문을 끝까지 읽어 바이트로 반환한다.
+func (c *s3Client) GetObject(ctx context.Context, bucket, key string) ([]byte, error) {
+	out, err := c.cli.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: &bucket,
+		Key:    &key,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("S3 객체 다운로드 실패(key=%s): %w", key, err)
+	}
+	defer out.Body.Close()
+	data, err := io.ReadAll(out.Body)
+	if err != nil {
+		return nil, fmt.Errorf("S3 객체 본문 읽기 실패(key=%s): %w", key, err)
+	}
+	return data, nil
+}
+
+// pageFileRe는 원본 파일명에서 페이지 번호를 뽑기 위한 정규식이다(evcharger_page{N}_{ts}.xml).
+var pageFileRe = regexp.MustCompile(`evcharger_page(\d+)_`)
+
+// RecoverRawPages는 S3에 보존된 특정 날짜의 원본 XML을 되읽어 RawPage 목록으로 복원한다.
+// API를 호출하지 않고 저장된 원본만으로 파이프라인(검증→정규화→DB적재)을 다시 태우기 위한
+// 수동 복구 경로다. zcode가 지정되면 item 단위로 필터링한다 — S3 키 구조에 zcode가 없고
+// 전국 수집 시 한 페이지에 여러 zcode가 섞일 수 있으므로 페이지 단위가 아닌 item 단위 필터가
+// 맞다. RawXML은 원본 그대로 보존하고 Items만 필터링한다. 파일명의 페이지 번호로 정렬하되,
+// 이는 로그 가독성 목적일 뿐 정합성엔 필수가 아니다(station upsert가 자연키 기준 멱등적이라
+// 순서가 뒤바뀌거나 중복 로드돼도 안전하다).
+func (s *Storage) RecoverRawPages(ctx context.Context, downloader S3Downloader, bucket, zcode, date string) ([]RawPage, error) {
+	// s3Key의 name을 비워 해당 날짜 raw 디렉터리 전체를 프리픽스로 만든다.
+	prefix := s.s3Key("raw", date, "")
+	keys, err := downloader.ListObjects(ctx, bucket, prefix)
+	if err != nil {
+		return nil, err
+	}
+	if len(keys) == 0 {
+		return nil, fmt.Errorf("복구 대상 원본 없음(bucket=%s, prefix=%s)", bucket, prefix)
+	}
+
+	// 파일명의 페이지 번호 기준 오름차순 정렬(가독성용).
+	sort.Slice(keys, func(i, j int) bool {
+		return pageNoFromKey(keys[i]) < pageNoFromKey(keys[j])
+	})
+
+	var pages []RawPage
+	for _, key := range keys {
+		data, err := downloader.GetObject(ctx, bucket, key)
+		if err != nil {
+			return nil, err
+		}
+		var resp model.Response
+		if err := xml.Unmarshal(data, &resp); err != nil {
+			log.Printf("[storage] 복구 중 XML 파싱 실패 — 건너뜀(key=%s): %v", key, err)
+			continue
+		}
+		items := resp.Body.Items.Item
+		if zcode != "" {
+			items = filterByZcode(items, zcode)
+		}
+		if len(items) == 0 {
+			continue
+		}
+		pages = append(pages, RawPage{
+			PageNo: pageNoFromKey(key),
+			RawXML: data,
+			Items:  items,
+		})
+	}
+	log.Printf("[storage] S3 복구 완료: %d개 원본에서 %d페이지 복원(zcode=%q, prefix=%s)", len(keys), len(pages), zcode, prefix)
+	return pages, nil
+}
+
+// pageNoFromKey는 S3 키(파일명)에서 페이지 번호를 추출한다. 추출 실패 시 0을 반환한다.
+func pageNoFromKey(key string) int {
+	m := pageFileRe.FindStringSubmatch(key)
+	if len(m) < 2 {
+		return 0
+	}
+	n, err := strconv.Atoi(m[1])
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
+// filterByZcode는 item 목록에서 지정 zcode(시도코드)에 해당하는 것만 남긴다.
+func filterByZcode(items []model.RawItem, zcode string) []model.RawItem {
+	var filtered []model.RawItem
+	for _, it := range items {
+		if it.Zcode == zcode {
+			filtered = append(filtered, it)
+		}
+	}
+	return filtered
 }

@@ -109,6 +109,36 @@ func (d *DB) GetUnverifiedNetworkID(ctx context.Context) (int64, error) {
 	return id, nil
 }
 
+// PreloadOperatorNetworkMap은 operator_code → network_id 매핑 전체를 한 번의
+// 쿼리로 조회해 in-memory map으로 반환한다. station 적재 루프에서 station마다
+// resolveNetworkID가 operator/charging_network를 DB에서 왕복 조회(N+1)하는 대신,
+// 루프 시작 전 이 map을 프리로드해 이미 알려진 operator_code는 DB 조회 없이 즉시
+// network_id를 얻게 한다. operator당 network 1개(V8 UNIQUE)를 전제로 INNER JOIN 한다.
+func (d *DB) PreloadOperatorNetworkMap(ctx context.Context) (map[string]int64, error) {
+	rows, err := d.sqldb.QueryContext(ctx,
+		`SELECT o.operator_code, cn.network_id
+		 FROM operator o
+		 JOIN charging_network cn ON cn.operator_id = o.operator_id`)
+	if err != nil {
+		return nil, fmt.Errorf("operator→network 매핑 프리로드 실패: %w", err)
+	}
+	defer rows.Close()
+
+	m := make(map[string]int64)
+	for rows.Next() {
+		var code string
+		var networkID int64
+		if serr := rows.Scan(&code, &networkID); serr != nil {
+			return nil, fmt.Errorf("operator→network 매핑 스캔 실패: %w", serr)
+		}
+		m[code] = networkID
+	}
+	if rerr := rows.Err(); rerr != nil {
+		return nil, fmt.Errorf("operator→network 매핑 순회 실패: %w", rerr)
+	}
+	return m, nil
+}
+
 // UpsertedCharger는 upsert된 charger의 DB id와 정규화 원본을 함께 담는다(캐시 갱신용).
 type UpsertedCharger struct {
 	ChargerID int64
@@ -125,7 +155,9 @@ type UpsertResult struct {
 // fallbackNetworkID는 station의 busiId가 비어 실제 operator를 해석할 수 없을 때만
 // 쓰는 미분류(UNVERIFIED) network_id다. busiId가 있으면 트랜잭션 안에서
 // resolveNetworkID가 실제 operator 기반 network_id를 해석해 사용한다.
-func (d *DB) UpsertStation(ctx context.Context, sourceID, fallbackNetworkID int64, st model.NormalizedStation) (UpsertResult, error) {
+// netCache는 PreloadOperatorNetworkMap으로 미리 채운 operator_code → network_id
+// 맵으로, 이미 알려진 operator는 DB 왕복 없이 해석하게 한다(nil이면 매번 DB 조회).
+func (d *DB) UpsertStation(ctx context.Context, sourceID, fallbackNetworkID int64, netCache map[string]int64, st model.NormalizedStation) (UpsertResult, error) {
 	var res UpsertResult
 
 	tx, err := d.sqldb.BeginTx(ctx, nil)
@@ -141,7 +173,7 @@ func (d *DB) UpsertStation(ctx context.Context, sourceID, fallbackNetworkID int6
 	}()
 
 	// busiId 기반으로 실제 operator/charging_network를 해석한다(같은 트랜잭션에 포함).
-	networkID, err := d.resolveNetworkID(ctx, tx, st.OperatorExternalID, st.OperatorName, fallbackNetworkID)
+	networkID, err := d.resolveNetworkID(ctx, tx, netCache, st.OperatorExternalID, st.OperatorName, fallbackNetworkID)
 	if err != nil {
 		return res, err
 	}
@@ -170,6 +202,14 @@ func (d *DB) UpsertStation(ctx context.Context, sourceID, fallbackNetworkID int6
 		return res, fmt.Errorf("커밋 실패: %w", err)
 	}
 	committed = true
+	// 커밋이 확정된 뒤에만 캐시에 반영한다(롤백된 트랜잭션이 만든 network_id를
+	// 캐시에 남기지 않기 위함). 이후 같은 operator_code를 가진 station은 DB 왕복 없이
+	// 이 network_id를 재사용한다.
+	if netCache != nil {
+		if code := strings.TrimSpace(st.OperatorExternalID); code != "" {
+			netCache[code] = networkID
+		}
+	}
 	return res, nil
 }
 
@@ -177,11 +217,19 @@ func (d *DB) UpsertStation(ctx context.Context, sourceID, fallbackNetworkID int6
 // 해석해 station이 연결될 network_id를 반환한다. operator/network가 없으면 생성하고,
 // 소스 표기가 바뀌었으면 최신화한다(모두 인자로 받은 tx로 실행 — station 단위
 // 트랜잭션에 포함시켜 원자성 유지). busiID가 비면 미분류 fallbackID를 그대로 쓴다.
-func (d *DB) resolveNetworkID(ctx context.Context, tx *sql.Tx, busiID, busiName string, fallbackID int64) (int64, error) {
+// netCache에 이미 있는 operator_code는 DB 왕복(N+1) 없이 즉시 network_id를 반환한다.
+func (d *DB) resolveNetworkID(ctx context.Context, tx *sql.Tx, netCache map[string]int64, busiID, busiName string, fallbackID int64) (int64, error) {
 	busiID = strings.TrimSpace(busiID)
 	if busiID == "" {
 		// 사업자 식별자가 없으면 미분류 fallback을 그대로 사용(추가 쿼리 없음).
 		return fallbackID, nil
+	}
+	// 프리로드된 캐시에 있으면 DB 조회 없이 즉시 해석한다(N+1 제거).
+	// 캐시에 없는 신규 operator만 아래 조회/생성 경로를 탄다.
+	if netCache != nil {
+		if id, ok := netCache[busiID]; ok {
+			return id, nil
+		}
 	}
 	busiName = strings.TrimSpace(busiName)
 	if busiName == "" {
