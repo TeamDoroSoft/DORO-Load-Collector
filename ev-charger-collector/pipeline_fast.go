@@ -102,7 +102,7 @@ func runFast(cfg fastConfig) {
 	}
 	stats.CollectedItems = len(allItems)
 
-	if err := stor.PersistItemsJSON(pages); err != nil {
+	if err := stor.PersistItemsJSON(ctx, pages, true); err != nil {
 		log.Printf("[warn] 집계 JSON 저장 실패(비치명적): %v", err)
 	}
 

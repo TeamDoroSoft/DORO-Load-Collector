@@ -56,7 +56,12 @@ func newStorage(ctx context.Context, outputDir string) *storage.Storage {
 	} else {
 		log.Printf("S3_BUCKET 미설정 — S3 업로드를 건너뛰고 로컬 저장만 수행한다.")
 	}
-	return storage.New(cfg, uploader)
+	stor := storage.New(cfg, uploader)
+	// fast/slow/archive 세 모드 공통 부트스트랩 지점이라, 여기서 한 번만 스윕하면
+	// 세 모드 모두에 적용된다. 업로드 성공 시 로컬 삭제가 정상 동작하면 지울 대상이
+	// 거의 없어야 정상이며, S3 미설정/삭제 실패 예외에 대한 이중 안전판이다.
+	stor.SweepOldLocalFiles(storage.DefaultRetentionMaxAge)
+	return stor
 }
 
 // newCache는 REDIS_HOST가 설정된 경우에만 캐시 클라이언트를 만든다.

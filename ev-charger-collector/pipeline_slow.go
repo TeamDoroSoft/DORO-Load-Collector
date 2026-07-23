@@ -143,7 +143,8 @@ func runSlow(cfg slowConfig) {
 
 	// 6) 집계 JSON 저장(디버그용, 비치명적). 원본 보존은 정상 수집 시 collectAll 내부에서
 	// 페이지별로 이미 끝났고, 복구 모드에서는 S3 재저장이 중복 데이터를 만들므로 하지 않는다.
-	if err := stor.PersistItemsJSON(pages); err != nil {
+	// 따라서 복구 모드(RecoverDate != "")에서는 uploadToS3=false로 넘겨 로컬 저장만 한다.
+	if err := stor.PersistItemsJSON(ctx, pages, cfg.RecoverDate == ""); err != nil {
 		log.Printf("[warn] 집계 JSON 저장 실패(비치명적): %v", err)
 	}
 

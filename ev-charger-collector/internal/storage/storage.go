@@ -3,7 +3,12 @@
 //     지수 백오프 3회 재시도로 S3에 업로드한다. 원본 보존은 CLAUDE.md 필수 규칙이라
 //     S3 업로드 실패 시 파이프라인 전체를 중단시키기 위해 error를 반환한다.
 //   - PersistErrorItems: 오류 item을 로컬+S3에 저장한다. 실패는 비치명적(경고만).
-//   - PersistItemsJSON: 기존 집계 JSON(디버그용)을 로컬에 저장한다.
+//   - PersistItemsJSON: 기존 집계 JSON(디버그용)을 로컬+S3에 저장한다.
+//
+// 세 저장 함수는 모두 "로컬 저장 → S3 업로드 → 성공 시 로컬 삭제"라는 동일한
+// 패턴을 따른다(원본은 CLAUDE.md §4에 따라 S3에 보존되므로, 업로드 성공 뒤 로컬
+// 사본을 지워도 원본 유실이 아니다). S3가 비활성이거나 삭제가 실패한 예외 상황을
+// 대비해 SweepOldLocalFiles가 오래된 로컬 파일을 정리하는 이중 안전판을 둔다.
 //
 // S3 클라이언트는 aws-sdk-go-v2 config.LoadDefaultConfig로 EC2 Instance Profile
 // 자격증명을 자동 사용한다(하드코딩 없음). S3Uploader 인터페이스로 추상화해
@@ -23,6 +28,7 @@ import (
 	"regexp"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/config"
@@ -99,6 +105,12 @@ func (s *Storage) PersistRawPage(ctx context.Context, p RawPage) error {
 		if err := s.uploadWithRetry(ctx, key, p.RawXML); err != nil {
 			return fmt.Errorf("원본 XML S3 업로드 실패(page=%d, key=%s): %w", p.PageNo, key, err)
 		}
+		// S3에 원본이 보존됐으므로 로컬 사본을 삭제한다(디스크 무한 누적 방지).
+		// 삭제 실패는 비치명적 — S3에 이미 보존됐으므로 원본 유실이 아니고,
+		// 남은 로컬 파일은 SweepOldLocalFiles가 나중에 정리한다.
+		if err := os.Remove(localPath); err != nil {
+			log.Printf("[warn] 원본 XML 로컬 사본 삭제 실패(비치명적, path=%s): %v", localPath, err)
+		}
 	}
 	return nil
 }
@@ -117,26 +129,44 @@ func (s *Storage) PersistRawPages(ctx context.Context, pages []RawPage) error {
 }
 
 // PersistItemsJSON은 전체 item을 가공 없이 모은 집계 JSON을 로컬에 저장한다(디버그용).
-func (s *Storage) PersistItemsJSON(pages []RawPage) error {
+// 다른 두 저장 함수와 동일하게, S3가 활성이고 uploadToS3=true면 업로드 후 로컬 사본을
+// 삭제한다. 복구 모드(pipeline_slow의 cfg.RecoverDate != "")에서는 이미 S3에 있던 원본을
+// 되읽는 것이므로 재업로드가 중복 오브젝트를 만든다 — 그 경우 uploadToS3=false로 호출해
+// 로컬 저장만 하고 삭제도 하지 않는다(복구 모드에서는 로컬 사본이 유일한 산출물).
+func (s *Storage) PersistItemsJSON(ctx context.Context, pages []RawPage, uploadToS3 bool) error {
 	if err := os.MkdirAll(s.cfg.OutputDir, 0o755); err != nil {
 		return fmt.Errorf("output 디렉터리 생성 실패: %w", err)
 	}
-	ts := time.Now().UTC().Format("20060102150405")
+	now := time.Now().UTC()
+	ts := now.Format("20060102150405")
+	datePart := now.Format("20060102")
+	fname := fmt.Sprintf("evcharger_items_%s.json", ts)
 
 	var allItems []model.RawItem
 	for _, p := range pages {
 		allItems = append(allItems, p.Items...)
 	}
 
-	path := filepath.Join(s.cfg.OutputDir, fmt.Sprintf("evcharger_items_%s.json", ts))
+	localPath := filepath.Join(s.cfg.OutputDir, fname)
 	data, err := marshalIndent(allItems)
 	if err != nil {
 		return fmt.Errorf("집계 JSON 인코딩 실패: %w", err)
 	}
-	if err := os.WriteFile(path, data, 0o644); err != nil {
+	if err := os.WriteFile(localPath, data, 0o644); err != nil {
 		return fmt.Errorf("집계 JSON 저장 실패: %w", err)
 	}
-	log.Printf("[storage] 집계 %d건 저장 완료 -> %s", len(allItems), path)
+
+	if s.s3Enabled() && uploadToS3 {
+		key := s.s3Key("items", datePart, fname)
+		if err := s.uploadWithRetry(ctx, key, data); err != nil {
+			return fmt.Errorf("집계 JSON S3 업로드 실패(key=%s): %w", key, err)
+		}
+		// S3에 보존됐으므로 로컬 사본 삭제(비치명적 — 남으면 SweepOldLocalFiles가 정리).
+		if err := os.Remove(localPath); err != nil {
+			log.Printf("[warn] 집계 JSON 로컬 사본 삭제 실패(비치명적, path=%s): %v", localPath, err)
+		}
+	}
+	log.Printf("[storage] 집계 %d건 저장 완료(로컬=%s, s3=%v)", len(allItems), localPath, s.s3Enabled() && uploadToS3)
 	return nil
 }
 
@@ -170,9 +200,78 @@ func (s *Storage) PersistErrorItems(ctx context.Context, items []validate.Invali
 		if err := s.uploadWithRetry(ctx, key, data); err != nil {
 			return fmt.Errorf("오류 item S3 업로드 실패(key=%s): %w", key, err)
 		}
+		// S3에 보존됐으므로 로컬 사본 삭제(비치명적 — 남으면 SweepOldLocalFiles가 정리).
+		if err := os.Remove(localPath); err != nil {
+			log.Printf("[warn] 오류 item 로컬 사본 삭제 실패(비치명적, path=%s): %v", localPath, err)
+		}
 	}
 	log.Printf("[storage] 오류 item %d건 저장 완료(로컬=%s, s3=%v)", len(items), localPath, s.s3Enabled())
 	return nil
+}
+
+// DefaultRetentionMaxAge는 SweepOldLocalFiles가 정리 대상으로 삼는 로컬 파일의 기본
+// 보존 기간이다(7일). 정상 운영(S3 활성)에서는 업로드 성공 즉시 로컬 사본이 지워지므로
+// 이 스윕이 실제로 지울 대상은 거의 없어야 정상이다 — 이는 S3 미설정 dev 환경이나
+// os.Remove 자체가 실패한 예외 케이스를 위한 이중 안전판이다.
+const DefaultRetentionMaxAge = 7 * 24 * time.Hour
+
+// sweepTarget은 SweepOldLocalFiles가 훑는 (디렉터리, 파일명 접두사, 접미사) 쌍이다.
+// 이 패키지가 직접 만드는 파일 패턴만 나열한다 — main 패키지 소유의
+// collector_checkpoint_*.json 등 다른 파일은 접두/접미 매칭에서 자연히 제외돼
+// 절대 삭제되지 않는다.
+type sweepTarget struct {
+	dir    string
+	prefix string
+	suffix string
+}
+
+// SweepOldLocalFiles는 이 패키지가 만든 로컬 산출물 중 mtime이 maxAge보다 오래된 것만
+// 삭제하고 삭제한 개수를 반환한다. 대상은 OutputDir 최상위의 evcharger_items_*.json,
+// raw/의 evcharger_page*.xml, errors/의 invalid_items_*.json 뿐이다. 이 패키지가 만들지
+// 않는 파일(체크포인트 등)은 접두/접미 패턴 불일치로 건드리지 않는다. 디렉터리가 아직
+// 없으면 조용히 건너뛴다(에러/패닉 없음). 개별 파일 삭제 실패는 비치명적 로그만 남긴다.
+func (s *Storage) SweepOldLocalFiles(maxAge time.Duration) int {
+	targets := []sweepTarget{
+		{dir: s.cfg.OutputDir, prefix: "evcharger_items_", suffix: ".json"},
+		{dir: filepath.Join(s.cfg.OutputDir, "raw"), prefix: "evcharger_page", suffix: ".xml"},
+		{dir: filepath.Join(s.cfg.OutputDir, "errors"), prefix: "invalid_items_", suffix: ".json"},
+	}
+	cutoff := time.Now().Add(-maxAge)
+	removed := 0
+	for _, tgt := range targets {
+		entries, err := os.ReadDir(tgt.dir)
+		if err != nil {
+			// 디렉터리가 아직 없거나(한 번도 안 쓴 output) 읽을 수 없으면 조용히 건너뛴다.
+			continue
+		}
+		for _, e := range entries {
+			if e.IsDir() {
+				continue
+			}
+			name := e.Name()
+			// 이 패키지가 만든 파일 패턴만 대상 — 그 외 파일은 절대 건드리지 않는다.
+			if !strings.HasPrefix(name, tgt.prefix) || !strings.HasSuffix(name, tgt.suffix) {
+				continue
+			}
+			info, err := e.Info()
+			if err != nil {
+				continue
+			}
+			if info.ModTime().After(cutoff) {
+				continue // 아직 보존 기간 내 — 유지.
+			}
+			path := filepath.Join(tgt.dir, name)
+			if err := os.Remove(path); err != nil {
+				log.Printf("[warn] 오래된 로컬 파일 삭제 실패(비치명적, path=%s): %v", path, err)
+				continue
+			}
+			removed++
+		}
+	}
+	if removed > 0 {
+		log.Printf("[storage] 레트리션 스윕: %d일 경과 로컬 파일 %d개 정리", int(maxAge.Hours()/24), removed)
+	}
+	return removed
 }
 
 // PersistHistoryArchiveBatch는 아카이브 대상 charger_status_history 배치 하나를 JSON으로
